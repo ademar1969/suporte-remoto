@@ -1,8 +1,8 @@
 # Automação de publicação: busca o código no repositório PRIVADO ademar1969/suporte-remoto-fonte (segredo CODIGO_TOKEN)
-# e publica as versões aqui. Para publicar: crie a tag vX.Y.Z neste repositório (script publicar-versao).
+# e publica as versões aqui. Para publicar: a mesma tag vX.Y precisa existir no privado e neste repositório.
 name: Publicar versão (APK + JARs)
 
-# Dispare criando uma tag, por exemplo:  git tag v1.24 && git push origin v1.24
+# Dispare criando uma tag, por exemplo:  git tag v1.26 && git push origin v1.26 (a tag tambem precisa existir no privado)
 # Ou manualmente em Actions > "Publicar versão" > Run workflow (gera os arquivos como artefatos).
 on:
   push:
@@ -34,14 +34,33 @@ jobs:
       # Usa o Gradle do proprio projeto (android/gradle/wrapper), o mesmo do Android Studio.
       - uses: gradle/actions/setup-gradle@v4
 
-      - name: Chave de assinatura do APK (opcional)
+      # Chave fixa do APK (Settings > Secrets and variables > Actions): KEYSTORE_BASE64, KEYSTORE_PASSWORD,
+      # KEY_ALIAS e KEY_PASSWORD. Sem ela o APK sairia com a chave de debug do GitHub, diferente a cada versao,
+      # e o Android recusa atualizar por cima ("App nao instalado"). Por isso a PUBLICACAO (tag) falha sem a chave;
+      # rodando manualmente (Run workflow) ainda gera um APK de teste com a chave de debug.
+      - name: Chave de assinatura do APK
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
-          if [ -n "$KEYSTORE_BASE64" ]; then
-            echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
-            echo "KEYSTORE_FILE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+          FALTA=""
+          [ -n "$KEYSTORE_BASE64" ] || FALTA="$FALTA KEYSTORE_BASE64"
+          [ -n "$KEYSTORE_PASSWORD" ] || FALTA="$FALTA KEYSTORE_PASSWORD"
+          [ -n "$KEY_ALIAS" ] || FALTA="$FALTA KEY_ALIAS"
+          [ -n "$KEY_PASSWORD" ] || FALTA="$FALTA KEY_PASSWORD"
+          if [ -n "$FALTA" ]; then
+            if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+              echo "::error::Faltam os secrets da chave do APK:$FALTA. Cadastre em Settings > Secrets and variables > Actions e publique de novo."
+              exit 1
+            fi
+            echo "::warning::Sem a chave fixa ($FALTA): APK de TESTE assinado com a chave de debug."
+            exit 0
           fi
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          test -s "$RUNNER_TEMP/release.jks" || { echo "::error::KEYSTORE_BASE64 nao e um base64 valido do .jks"; exit 1; }
+          echo "KEYSTORE_FILE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
 
       - name: Compilar APK do celular
         working-directory: android
@@ -52,6 +71,16 @@ jobs:
         run: |
           chmod +x ./gradlew
           ./gradlew --no-daemon assembleRelease
+
+      - name: Conferir assinatura do APK
+        run: |
+          APK=$(find android/app/build/outputs/apk/release -name '*.apk' | head -n 1)
+          SIGNER=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -n 1)
+          "$SIGNER" verify --print-certs "$APK" | tee certs.txt
+          if [[ "$GITHUB_REF" == refs/tags/v* ]] && grep -q "CN=Android Debug" certs.txt; then
+            echo "::error::O APK saiu com a chave de debug. Confira os secrets da chave do APK."
+            exit 1
+          fi
 
       - name: Juntar arquivos
         run: |
@@ -74,7 +103,12 @@ jobs:
           test -f dist-setup/jre/bin/javaw.exe
           cp target/suporte-remoto-$VERSAO-client.jar dist-setup/suporte-remoto-client.jar
           cp instalador/arquivos/icone.ico dist-setup/
+          mkdir -p dist-setup/propaganda
+          cp instalador/setup/propaganda-LEIA-ME.txt dist-setup/propaganda/_LEIA-ME.txt
           sudo apt-get update -qq && sudo apt-get install -y -qq nsis
+          # lancador do modo administrador (pede administrador ao Windows), entra dentro do instalador
+          makensis -V2 -DVERSAO=$VERSAO -DPASTA="$GITHUB_WORKSPACE/dist-setup" instalador/setup/SuporteRemoto-Admin.nsi
+          mv instalador/setup/SuporteRemoto-Admin.exe dist-setup/
           makensis -V2 -DVERSAO=$VERSAO -DPASTA="$GITHUB_WORKSPACE/dist-setup" instalador/setup/SuporteRemoto.nsi
           cp instalador/setup/SuporteRemoto-Setup-$VERSAO.exe dist/
           ls -la dist
